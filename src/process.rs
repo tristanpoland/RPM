@@ -76,14 +76,42 @@ impl ManagedProcess {
             return Ok(());
         }
 
-        let mut cmd = TokioCommand::new("sh");
-        cmd.arg("-c").arg(&self.info.command);
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut cmd = TokioCommand::new("sh");
+            cmd.arg("-c").arg(&self.info.command);
+            cmd
+        };
 
         #[cfg(windows)]
-        {
-            cmd = TokioCommand::new("cmd");
-            cmd.arg("/C").arg(&self.info.command);
-        }
+        let mut cmd = {
+            let parts: Vec<&str> = self.info.command.split_whitespace().collect();
+            if parts.is_empty() {
+                return Err(RpmError::Process("Empty command".to_string()));
+            }
+            
+            // Try to find the executable in PATH if it's not already a full path
+            let executable = if std::path::Path::new(parts[0]).exists() {
+                parts[0].to_string()
+            } else {
+                match find_executable_in_path(parts[0]) {
+                    Some(path) => {
+                        tracing::info!("Found executable '{}' at path: {}", parts[0], path);
+                        path
+                    }
+                    None => {
+                        tracing::warn!("Could not find executable '{}' in PATH", parts[0]);
+                        parts[0].to_string()
+                    }
+                }
+            };
+            
+            let mut cmd = TokioCommand::new(executable);
+            if parts.len() > 1 {
+                cmd.args(&parts[1..]);
+            }
+            cmd
+        };
 
         if let Some(cwd) = &self.info.config.cwd {
             cmd.current_dir(cwd);
@@ -376,4 +404,62 @@ fn get_process_usage_windows(pid: u32) -> Result<(f64, u64)> {
     }
     
     Ok((0.0, 0))
+}
+
+#[cfg(windows)]
+fn find_executable_in_path(name: &str) -> Option<String> {
+    use std::env;
+    use std::path::{Path, PathBuf};
+    
+    tracing::debug!("Looking for executable: {}", name);
+    
+    // If it already has an extension, try as-is first
+    if name.contains('.') {
+        if Path::new(name).exists() {
+            return Some(name.to_string());
+        }
+    }
+    
+    // Get PATH environment variable
+    let path_var = match env::var("PATH") {
+        Ok(path) => {
+            tracing::debug!("PATH: {}", path);
+            path
+        }
+        Err(e) => {
+            tracing::warn!("Failed to get PATH environment variable: {}", e);
+            return None;
+        }
+    };
+    
+    let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    tracing::debug!("PATHEXT: {}", pathext);
+    
+    // Split PATHEXT into extensions
+    let extensions: Vec<&str> = pathext.split(';').filter(|s| !s.is_empty()).collect();
+    
+    // Search each directory in PATH
+    for path_dir in path_var.split(';').filter(|s| !s.is_empty()) {
+        let path_dir = PathBuf::from(path_dir.trim());
+        tracing::debug!("Searching in directory: {:?}", path_dir);
+        
+        // Try the name as-is first
+        let full_path = path_dir.join(name);
+        if full_path.exists() {
+            tracing::debug!("Found executable at: {:?}", full_path);
+            return Some(full_path.to_string_lossy().to_string());
+        }
+        
+        // Try with each extension from PATHEXT
+        for ext in &extensions {
+            let full_path = path_dir.join(format!("{}{}", name, ext));
+            if full_path.exists() {
+                tracing::debug!("Found executable at: {:?}", full_path);
+                return Some(full_path.to_string_lossy().to_string());
+            }
+        }
+    }
+    
+    tracing::debug!("Executable '{}' not found in PATH", name);
+    None
 }

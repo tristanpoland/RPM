@@ -27,14 +27,27 @@ async fn start_daemon_background() -> Result<()> {
             Ok(()) => Ok(()),
             Err(e) => {
                 eprintln!("Failed to install as Windows service: {}", e);
-                eprintln!("Falling back to foreground mode...");
-                start_daemon_foreground().await
+                Err(e)
             }
         }
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        macos_service::install_and_start_launchd_service().await
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_service::install_and_start_systemd_service().await
+    }
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
     {
         unix_daemon::daemonize_and_start().await
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        Err(RpmError::Daemon(
+            "Background service mode is not supported on this platform. Please run in foreground mode with --foreground.".to_string()
+        ))
     }
 }
 
@@ -218,7 +231,160 @@ mod windows_service {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+mod macos_service {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    pub async fn install_and_start_launchd_service() -> crate::Result<()> {
+        let service_name = "com.rpm.daemon";
+        let current_exe = std::env::current_exe()
+            .map_err(|e| RpmError::Daemon(format!("Failed to get current exe: {}", e)))?;
+
+        let plist_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+        <string>--service</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/rpm-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/rpm-daemon.err</string>
+</dict>
+</plist>"#,
+            service_name,
+            current_exe.display()
+        );
+
+        let plist_path = format!("/Library/LaunchDaemons/{}.plist", service_name);
+        
+        fs::write(&plist_path, plist_content)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    RpmError::Daemon("Failed to write launchd plist: Permission denied. Please run with sudo.".to_string())
+                } else {
+                    RpmError::Daemon(format!("Failed to write launchd plist: {}", e))
+                }
+            })?;
+
+        let output = Command::new("launchctl")
+            .args(&["load", &plist_path])
+            .output()
+            .map_err(|e| RpmError::Daemon(format!("Failed to load service: {}", e)))?;
+
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(RpmError::Daemon(format!("Failed to load service: {} {}", error, stdout)));
+        }
+
+        let output = Command::new("launchctl")
+            .args(&["start", service_name])
+            .output()
+            .map_err(|e| RpmError::Daemon(format!("Failed to start service: {}", e)))?;
+
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(RpmError::Daemon(format!("Failed to start service: {} {}", error, stdout)));
+        }
+
+        println!("macOS launchd service installed and started successfully");
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_service {
+    use super::*;
+    use std::fs;
+
+    pub async fn install_and_start_systemd_service() -> crate::Result<()> {
+        let service_name = "rpm-daemon";
+        let current_exe = std::env::current_exe()
+            .map_err(|e| RpmError::Daemon(format!("Failed to get current exe: {}", e)))?;
+
+        let systemd_content = format!(
+            r#"[Unit]
+Description=RPM Process Manager Daemon
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart={} --service
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"#,
+            current_exe.display()
+        );
+
+        let service_path = format!("/etc/systemd/system/{}.service", service_name);
+        
+        fs::write(&service_path, systemd_content)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    RpmError::Daemon("Failed to write systemd service file: Permission denied. Please run with sudo.".to_string())
+                } else {
+                    RpmError::Daemon(format!("Failed to write systemd service file: {}", e))
+                }
+            })?;
+
+        let output = Command::new("systemctl")
+            .args(&["daemon-reload"])
+            .output()
+            .map_err(|e| RpmError::Daemon(format!("Failed to reload systemd: {}", e)))?;
+
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(RpmError::Daemon(format!("Failed to reload systemd: {}", error)));
+        }
+
+        let output = Command::new("systemctl")
+            .args(&["enable", service_name])
+            .output()
+            .map_err(|e| RpmError::Daemon(format!("Failed to enable service: {}", e)))?;
+
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(RpmError::Daemon(format!("Failed to enable service: {}", error)));
+        }
+
+        let output = Command::new("systemctl")
+            .args(&["start", service_name])
+            .output()
+            .map_err(|e| RpmError::Daemon(format!("Failed to start service: {}", e)))?;
+
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(RpmError::Daemon(format!("Failed to start service: {} {}", error, stdout)));
+        }
+
+        println!("Linux systemd service installed and started successfully");
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 mod unix_daemon {
     use super::*;
     use daemonize::Daemonize;

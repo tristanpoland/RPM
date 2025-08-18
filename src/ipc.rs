@@ -360,37 +360,6 @@ impl IpcClient {
         }
     }
 
-    pub async fn monitor(&self) -> Result<()> {
-        println!("Monitor mode - Press Ctrl+C to exit");
-        
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
-        loop {
-            interval.tick().await;
-            
-            match self.list_processes().await {
-                Ok(processes) => {
-                    print!("\x1B[2J\x1B[1;1H"); // Clear screen
-                    println!("{:<15} {:<10} {:<15} {:<10} {:<20}", "NAME", "ID", "STATUS", "CPU", "MEMORY");
-                    println!("{}", "-".repeat(80));
-                    
-                    for process in processes {
-                        println!(
-                            "{:<15} {:<10} {:<15} {:<10} {:<20}",
-                            process.name,
-                            process.id,
-                            process.status,
-                            format!("{}%", process.cpu_usage),
-                            format!("{}MB", process.memory_usage / 1024 / 1024)
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error fetching process list: {}", e);
-                    break Ok(());
-                }
-            }
-        }
-    }
 
     pub async fn kill_daemon(&self) -> Result<()> {
         match self.send_request(IpcRequest::KillDaemon).await? {

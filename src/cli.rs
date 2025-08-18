@@ -78,6 +78,8 @@ pub enum Commands {
     Save,
     #[command(about = "Resurrect saved processes")]
     Resurrect,
+    #[command(about = "Show daemon status")]
+    Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
